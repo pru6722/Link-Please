@@ -52,3 +52,12 @@ We implement a **Tombstone Pattern**:
 1. **Tombstone Database Table:** We maintain a `deleted_comments` table that records the `comment_id` of all deleted comments.
 2. **Deletes Enforce Tombstones:** When a `comment.deleted` event is received, we insert the `comment_id` into the `deleted_comments` table, and also update any existing jobs for that comment to `is_deleted = True`.
 3. **Creation Checks Tombstones:** When a `comment.created` event is received, we check if the `comment_id` already exists in `deleted_comments`. If it does, we immediately discard the event and do not queue any DM jobs, preventing out-of-order race conditions.
+
+---
+
+## 4 Honest Bullets: How the System Can Still Fail
+
+1. **Losing a DM (Disk Corruption or Permanent Loss):** If the SQLite database file on disk experiences catastrophic corruption or is deleted on the container host before WAL logs are synced to a persistent volume, any queued or retrying jobs will be lost.
+2. **Losing a DM (Host Crash during Outbound Request):** If the server crashes after a request to `/v1/dm/send` has succeeded on the mock API, but *before* the worker gets the response and records the `dm_id` to the database, the job's `dm_id` remains `None`. In subsequent retries, the worker will send a new idempotency key (since the retry count increments), which the mock server will treat as a new request. If the mock server has internal user DM limits, it may reject it as a duplicate or fail it, causing the message to be lost.
+3. **Sending a Duplicate (Platform Idempotency Cache Expiration):** If the platform's idempotency key cache has a short TTL (e.g. 5 minutes) and a job is retried or re-sent after that TTL expires, the platform will treat the request as a new one and send a duplicate DM to the recipient.
+4. **Reporting a Wrong Number (State Lag):** If a user queries `/stats` while a worker is mid-transaction updating job statuses in the database, the counts returned may temporarily lag by a few milliseconds before committing.

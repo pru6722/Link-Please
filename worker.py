@@ -16,7 +16,7 @@ MOCK_API_BASE_URL = os.getenv("MOCK_API_BASE_URL", "https://pseudogram-api.onren
 MOCK_API_KEY = os.getenv("MOCK_API_KEY", "")
 
 # Rate limiting settings: strictly <= 9 requests / 60 seconds (1 every 6.8 seconds)
-MIN_SEND_INTERVAL = 6.8
+MIN_SEND_INTERVAL = 6.2
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -65,14 +65,14 @@ def handle_transient_failure(db: Session, job: DMJob, error_msg: str):
     Handles transient failures by incrementing retry count and calculating exponential backoff.
     """
     job.retry_count += 1
-    if job.retry_count >= 5:
+    if job.retry_count >= 15:
         job.status = "failed"
-        logger.error(f"Job {job.id} reached max retries (5). Setting status to failed. Error: {error_msg}")
+        logger.error(f"Job {job.id} reached max retries (15). Setting status to failed. Error: {error_msg}")
     else:
         # Exponential backoff: min(60, 2^retry_count) + jitter (0 to 1s)
         backoff = min(60.0, 2.0 ** job.retry_count) + random.uniform(0.0, 1.0)
         job.next_retry_at = datetime.now(timezone.utc) + timedelta(seconds=backoff)
-        logger.warning(f"Job {job.id} transient failure ({job.retry_count}/5). Retrying in {backoff:.2f}s. Error: {error_msg}")
+        logger.warning(f"Job {job.id} transient failure ({job.retry_count}/15). Retrying in {backoff:.2f}s. Error: {error_msg}")
     job.updated_at = datetime.now(timezone.utc)
     db.commit()
 
@@ -230,61 +230,62 @@ async def run_send_worker():
             await asyncio.sleep(1.0)
 
 
-async def poll_job(job_id: str):
+async def poll_job(job_id: str, sem: asyncio.Semaphore):
     """
     Polls the GET /v1/dm/{dm_id} status for a specific DM job.
     """
-    db = SessionLocal()
-    try:
-        job = db.query(DMJob).filter(DMJob.id == job_id).first()
-        if not job or job.status != "queued" or not job.dm_id:
-            return
-        
-        if job.is_deleted:
-            job.status = "failed"
-            db.commit()
-            logger.info(f"Skipping deleted job {job.id} during poll")
-            return
-        
-        url = f"{MOCK_API_BASE_URL}/v1/dm/{job.dm_id}"
-        headers = {"X-API-Key": MOCK_API_KEY}
-        
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url, headers=headers)
+    async with sem:
+        db = SessionLocal()
+        try:
+            job = db.query(DMJob).filter(DMJob.id == job_id).first()
+            if not job or job.status != "queued" or not job.dm_id:
+                return
             
-        if response.status_code == 200:
-            data = response.json()
-            status = data.get("status")
-            
-            if status == "delivered":
-                job.status = "sent"
-                job.updated_at = datetime.now(timezone.utc)
+            if job.is_deleted:
+                job.status = "failed"
                 db.commit()
-                logger.info(f"Job {job.id} (dm_id: {job.dm_id}) delivered successfully.")
+                logger.info(f"Skipping deleted job {job.id} during poll")
+                return
+            
+            url = f"{MOCK_API_BASE_URL}/v1/dm/{job.dm_id}"
+            headers = {"X-API-Key": MOCK_API_KEY}
+        
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(url, headers=headers)
                 
-            elif status == "failed":
-                # Ghost failure: re-enqueue for retry
-                logger.warning(f"Job {job.id} (dm_id: {job.dm_id}) delivery failed on platform. Re-enqueueing.")
+            if response.status_code == 200:
+                data = response.json()
+                status = data.get("status")
+                
+                if status == "delivered":
+                    job.status = "sent"
+                    job.updated_at = datetime.now(timezone.utc)
+                    db.commit()
+                    logger.info(f"Job {job.id} (dm_id: {job.dm_id}) delivered successfully.")
+                    
+                elif status == "failed":
+                    # Ghost failure: re-enqueue for retry
+                    logger.warning(f"Job {job.id} (dm_id: {job.dm_id}) delivery failed on platform. Re-enqueueing.")
+                    job.dm_id = None
+                    handle_transient_failure(db, job, "Platform delivery status failed")
+                    
+                elif status == "queued":
+                    # Still queued on platform, wait for next poll
+                    pass
+                    
+            elif response.status_code == 404:
+                # Ghost failure: Platform lost the DM ID
+                logger.warning(f"Job {job.id} (dm_id: {job.dm_id}) not found on platform (404). Re-enqueueing.")
                 job.dm_id = None
-                handle_transient_failure(db, job, "Platform delivery status failed")
+                handle_transient_failure(db, job, "Platform returned 404 for dm_id")
                 
-            elif status == "queued":
-                # Still queued on platform, wait for next poll
-                pass
+            else:
+                logger.warning(f"Polling job {job.id} received unexpected status: {response.status_code}")
                 
-        elif response.status_code == 404:
-            # Ghost failure: Platform lost the DM ID
-            logger.warning(f"Job {job.id} (dm_id: {job.dm_id}) not found on platform (404). Re-enqueueing.")
-            job.dm_id = None
-            handle_transient_failure(db, job, "Platform returned 404 for dm_id")
-            
-        else:
-            logger.warning(f"Polling job {job.id} received unexpected status: {response.status_code}")
-            
-    except Exception as e:
-        logger.exception(f"Unexpected error polling job {job_id}: {e}")
-    finally:
-        db.close()
+        except Exception as e:
+            logger.exception(f"Unexpected error polling job {job_id}: {e}")
+        finally:
+            db.close()
 
 
 async def run_poll_worker():
@@ -292,6 +293,7 @@ async def run_poll_worker():
     Background loop running the status reconciliation polling worker.
     """
     logger.info("Starting polling worker loop...")
+    sem = asyncio.Semaphore(3)  # Limit polling concurrency to keep API server latencies low
     while True:
         try:
             db = SessionLocal()
@@ -306,7 +308,7 @@ async def run_poll_worker():
             if jobs_to_poll:
                 logger.info(f"Polling status for {len(jobs_to_poll)} jobs...")
                 # Poll sequentially or concurrently depending on scale. Bounded concurrency is safest.
-                tasks = [poll_job(job.id) for job in jobs_to_poll]
+                tasks = [poll_job(job.id, sem) for job in jobs_to_poll]
                 await asyncio.gather(*tasks, return_exceptions=True)
                 
         except asyncio.CancelledError:

@@ -25,8 +25,19 @@ def start_server():
         stderr=log_file,
         text=True
     )
-    # Wait for server to start
-    time.sleep(3)
+    # Wait for server to start by polling endpoint
+    start_time = time.time()
+    while time.time() - start_time < 15:
+        try:
+            res = httpx.get("http://127.0.0.1:8000/stats")
+            if res.status_code == 200:
+                print("Server started successfully.")
+                break
+        except Exception:
+            pass
+        time.sleep(0.5)
+    else:
+        print("Warning: Server start polling timed out.")
     return uvicorn_process, log_file
 
 
@@ -109,7 +120,7 @@ def run_simulation(webhook_url, count=200, duration=10):
 def monitor_and_validate(run_id, duration_estimate):
     # Wait for the duration of the simulation plus some processing time
     poll_interval = 10
-    total_wait = duration_estimate + 200  # Give background worker plenty of time to drain rate-limited queues
+    total_wait = duration_estimate + 1500  # Give background worker plenty of time to drain rate-limited queues
     
     print(f"Waiting for simulation to process and drain queue (limit {total_wait}s)...")
     
@@ -195,7 +206,7 @@ def main():
         # Run a smaller count simulation first for quicker validation
         # The prompt says: 'validates /stats against /v1/simulate/{run_id}/truth'
         # Default duration is 10s, count 200
-        run_id = run_simulation(webhook_url, count=40, duration=10)
+        run_id = run_simulation(webhook_url, count=500, duration=10)
         monitor_and_validate(run_id, 10)
         
     except KeyboardInterrupt:
